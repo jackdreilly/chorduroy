@@ -1,0 +1,15 @@
+[package]
+name = "chorduroy"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+coremidi = "0.7.0"
+cpal = "0.15.1"
+itertools = "0.10.5"
+midly = "0.5.3"
+rand = "0.8.5"
+rustfft = "6.1.0"
+textplots = "0.8.0"
