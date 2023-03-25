@@ -27,8 +27,11 @@ struct Args {
     destination: Option<String>,
     #[arg(short, long)]
     audio: Option<String>,
+    #[arg(short, long, default_value_t = false)]
+    plot: bool,
 }
 
+#[derive(Debug)]
 enum Event {
     Note(bool, u8),
     Chord(String, Vec<usize>),
@@ -40,16 +43,22 @@ fn main() {
         source,
         destination,
         audio,
+        plot,
     } = Args::parse();
     let (tx, rx) = mpsc::channel();
     let tx2 = tx.clone();
     thread::spawn(move || {
-        publish_chords_from_audio(audio.unwrap_or_else(|| "Black".into()), milliseconds, tx);
+        publish_chords_from_audio(
+            audio.unwrap_or_else(|| "Black".into()),
+            milliseconds,
+            tx,
+            plot,
+        );
         block();
     });
 
     thread::spawn(move || {
-        publish_midi_in_events(source.unwrap_or_else(|| "OP-1".into()), tx2);
+        let _hack = publish_midi_in_events(source.unwrap_or_else(|| "OP-1".into()), tx2);
         block();
     });
     output_remapped_midi_notes(destination, rx);
@@ -70,6 +79,7 @@ fn output_remapped_midi_notes(destination: Option<String>, rx: mpsc::Receiver<Ev
                 active_chord_notes = chord;
             }
             Event::Note(on, note) => {
+                let note = note.min(127) * 2;
                 if active_chord_notes.is_empty() {
                     continue;
                 }
@@ -90,7 +100,12 @@ fn output_remapped_midi_notes(destination: Option<String>, rx: mpsc::Receiver<Ev
     }
 }
 
-fn publish_chords_from_audio(audio: String, milliseconds: u32, tx: mpsc::Sender<Event>) {
+fn publish_chords_from_audio(
+    audio: String,
+    milliseconds: u32,
+    tx: mpsc::Sender<Event>,
+    plot: bool,
+) {
     let guesser = ChordGuesser::default();
     let device = get_audio_device(audio);
     let config = device.default_input_config().unwrap().into();
@@ -133,15 +148,17 @@ fn publish_chords_from_audio(audio: String, milliseconds: u32, tx: mpsc::Sender<
                             .sum::<f32>()
                     })
                     .collect_vec();
-                Chart::new_with_y_range(100, 50, 0f32, 11f32, 0f32, 0.1f32)
-                    .lineplot(&textplots::Shape::Bars(
-                        &bars
-                            .iter()
-                            .enumerate()
-                            .map(|(i, x)| (i as f32, *x))
-                            .collect_vec(),
-                    ))
-                    .display();
+                if plot {
+                    Chart::new_with_y_range(100, 50, 0f32, 11f32, 0f32, 0.1f32)
+                        .lineplot(&textplots::Shape::Bars(
+                            &bars
+                                .iter()
+                                .enumerate()
+                                .map(|(i, x)| (i as f32, *x))
+                                .collect_vec(),
+                        ))
+                        .display();
+                }
 
                 let best_notes = bars
                     .iter()
@@ -162,11 +179,11 @@ fn publish_chords_from_audio(audio: String, milliseconds: u32, tx: mpsc::Sender<
     stream.play().unwrap();
 }
 
-fn publish_midi_in_events(source: String, tx: mpsc::Sender<Event>) {
-    let source = Sources
-        .into_iter()
-        .find(|x| x.name().unwrap().contains(&source))
-        .unwrap();
+fn publish_midi_in_events(
+    source: String,
+    tx: mpsc::Sender<Event>,
+) -> (Client, coremidi::InputPortWithContext<u32>) {
+    let source = get_source(source);
     let client = Client::new("Example Client").unwrap();
     let mut input_port = client
         .input_port_with_protocol("Example Port", Protocol::Midi10, move |event_list, _| {
@@ -183,6 +200,14 @@ fn publish_midi_in_events(source: String, tx: mpsc::Sender<Event>) {
     input_port
         .connect_source(&source, source.unique_id().unwrap_or(0))
         .unwrap();
+    (client, input_port)
+}
+
+fn get_source(source: String) -> coremidi::Source {
+    Sources
+        .into_iter()
+        .find(|x| x.name().unwrap().contains(&source))
+        .unwrap()
 }
 
 fn block() {
@@ -264,7 +289,7 @@ impl ChordGuesser {
         }
     }
     pub fn guess(&self, notes: &[usize]) -> Option<String> {
-        [vec![0, 1, 2]]
+        [vec![0, 1, 2], vec![0, 1, 2, 3]]
             .into_iter()
             .flat_map(|idxs| {
                 self.chord_hash_to_name
