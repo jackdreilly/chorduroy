@@ -1,26 +1,57 @@
+#![feature(iter_collect_into)]
+
+mod model;
+
 use coremidi::{Client, Destination, Destinations, OutputPort, Protocol};
 use coremidi::{PacketBuffer, Sources};
-use cpal::default_host;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use cpal::{default_host, StreamConfig, SupportedBufferSize};
+use model::{Chord, Model, Note, Observation};
+use rustfft::FftPlanner;
+use serde::Serialize;
+use strum::IntoEnumIterator;
 use textplots::{Chart, Plot};
+use websocket::Message;
 
-use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::f32::consts::PI;
 use std::io::{stdin, BufRead};
+use std::process::Command;
 use std::sync::mpsc;
 use std::thread;
 
 use clap::Parser;
 use itertools::Itertools;
-pub const NOTE_NAMES: [&str; 12] = [
-    "A", "A#", "B", "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#",
-];
 
-#[derive(Parser, Debug)]
+use crate::model::NUM_CHORDS;
+
+#[derive(Serialize)]
+struct FullQ {
+    x: Vec<Note>,
+    y: Vec<Vec<f32>>,
+}
+#[derive(Serialize)]
+struct BucketedQ {
+    x: Vec<Note>,
+    y: Vec<f32>,
+}
+#[derive(Serialize)]
+struct WebPayload {
+    full_q: FullQ,
+    bucketed_q: BucketedQ,
+    chord: Chord,
+    fft: Vec<f32>,
+}
+
+#[derive(Parser, Debug, Clone)]
 #[command(author, version, about, long_about = None)]
 struct Args {
-    #[arg(short, long, default_value_t = 14)]
+    #[arg(short, long, default_value_t = 200)]
     milliseconds: u32,
+    #[arg(short, long, default_value_t = 5)]
+    octaves: u32,
+    #[arg(short, long, default_value_t = 0)]
+    low_octave: u32,
     #[arg(short, long)]
     source: Option<String>,
     #[arg(short, long)]
@@ -29,30 +60,67 @@ struct Args {
     audio: Option<String>,
     #[arg(short, long, default_value_t = false)]
     plot: bool,
+    #[arg(long, default_value_t = false)]
+    max_buffer: bool,
+    #[arg(short, long, default_value_t = false)]
+    chrome: bool,
 }
 
 #[derive(Debug)]
 enum Event {
     Note(bool, u8),
-    Chord(String, Vec<usize>),
+    Chord(Chord),
 }
 
 fn main() {
+    let args = Args::parse();
     let Args {
         milliseconds,
         source,
         destination,
         audio,
-        plot,
-    } = Args::parse();
+        chrome,
+        ..
+    } = args.clone();
     let (tx, rx) = mpsc::channel();
     let tx2 = tx.clone();
+    let (t_chords, r_chords) = mpsc::channel::<WebPayload>();
+    thread::spawn(move || {
+        if chrome {
+            Command::new("open")
+                .args(["/Applications/Google Chrome.app"])
+                .output()
+                .unwrap();
+        }
+        // Run the command, forwarding output to stdout.
+        Command::new("deno")
+            .args(["task", "--cwd", "web", "start"])
+            .status()
+            .unwrap();
+    });
+    thread::spawn(move || {
+        use websocket::sync::Server;
+        let server = Server::bind("127.0.0.1:1234").unwrap();
+        for client in server.filter_map(Result::ok) {
+            let mut client = client.accept().unwrap();
+            loop {
+                let chord = r_chords.recv().unwrap();
+                if client
+                    .send_message(&Message::text(&serde_json::to_string(&chord).unwrap()))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        }
+    });
     thread::spawn(move || {
         publish_chords_from_audio(
             audio.unwrap_or_else(|| "Black".into()),
             milliseconds,
             tx,
-            plot,
+            t_chords,
+            args,
         );
         block();
     });
@@ -66,28 +134,21 @@ fn main() {
 
 fn output_remapped_midi_notes(destination: Option<String>, rx: mpsc::Receiver<Event>) {
     let player = Player::new(&destination.unwrap_or_else(|| "Garage".into()));
-    let mut active_chord_notes = vec![];
+    let mut active_chord = Chord::from(0);
     let mut midi_note_remapping_history = vec![0; 256];
-    let mut active_chord_name = "".to_string();
     for event in rx {
         match event {
-            Event::Chord(new_name, chord) => {
-                if active_chord_name != new_name {
-                    println!("{}", new_name);
-                }
-                active_chord_name = new_name;
-                active_chord_notes = chord;
+            Event::Chord(chord) => {
+                active_chord = chord;
             }
             Event::Note(on, note) => {
-                let note = note.min(127) * 2;
-                if active_chord_notes.is_empty() {
-                    continue;
-                }
+                dbg!(on, note, active_chord);
                 if !on {
                     player.play_off(midi_note_remapping_history[note as usize]);
                     continue;
                 }
-                let new_note = active_chord_notes
+                let new_note = active_chord
+                    .notes()
                     .iter()
                     .map(|&n| n as u8 + 9)
                     .min_by_key(|f| f.abs_diff(note) % 12)
@@ -104,25 +165,53 @@ fn publish_chords_from_audio(
     audio: String,
     milliseconds: u32,
     tx: mpsc::Sender<Event>,
-    plot: bool,
+    t_chords: mpsc::Sender<WebPayload>,
+    Args {
+        max_buffer,
+        octaves,
+        low_octave,
+        plot,
+        ..
+    }: Args,
 ) {
-    let guesser = ChordGuesser::default();
     let device = get_audio_device(audio);
-    let config = device.default_input_config().unwrap().into();
-    let mut buffer = vec![];
+    let input_config = device.default_input_config().unwrap();
+    let mut config: StreamConfig = input_config.clone().into();
+    if max_buffer {
+        config.buffer_size = match &input_config.buffer_size() {
+            SupportedBufferSize::Range { max, .. } => cpal::BufferSize::Fixed(*max),
+            SupportedBufferSize::Unknown => cpal::BufferSize::Default,
+        };
+    }
+    let mut buffer: Vec<f32> = vec![];
+    let model = Model::default();
+    let mut observations: VecDeque<Observation> = VecDeque::new();
     let stream = device
         .build_input_stream(
             &config,
             move |data: &[f32], _| {
-                buffer.extend_from_slice(data);
-                buffer = buffer[0
-                    .max(buffer.len() as i32 - (milliseconds / 1000 * config.sample_rate.0) as i32)
-                    as usize..]
-                    .to_vec();
+                buffer.reserve(data.len() / config.channels as usize);
+                data.chunks_exact(config.channels as usize)
+                    .map(|c| c.iter().sum::<f32>())
+                    .collect_into(&mut buffer);
+                let max_size = config.sample_rate.0 as usize * milliseconds as usize / 1000;
+                if buffer.len() > max_size {
+                    buffer.drain(0..data.len() / config.channels as usize);
+                }
+                let data = &buffer;
                 let rate = config.sample_rate.0 as f32;
-                let bars = (0..12)
+                let mut fft = data.iter().map_into().collect_vec();
+                FftPlanner::new()
+                    .plan_fft_forward(data.len())
+                    .process(&mut fft);
+                let fft = fft[0..data.len() / 2]
+                    .iter_mut()
+                    .take(250)
+                    .map(|f| f.norm())
+                    .collect_vec();
+                let full_q = (0..12)
                     .map(move |note| {
-                        (0..4)
+                        (low_octave..octaves + low_octave)
                             .map(|octave| {
                                 let bin = octave * 12 + note;
                                 let f_k: f32 = 55f32 * 2.0_f32.powf(bin as f32 / 12_f32);
@@ -143,13 +232,22 @@ fn publish_chords_from_audio(
                                     sum_real += real_common * cos;
                                     sum_imag += real_common * sin;
                                 }
-                                sum_real.hypot(sum_imag)
+                                sum_real.hypot(sum_imag) * (octave + 2) as f32
                             })
-                            .sum::<f32>()
+                            .collect_vec()
                     })
                     .collect_vec();
+                let bars = full_q
+                    .iter()
+                    .map(|x| x.iter().sum::<f32>() / x.len() as f32)
+                    .collect_vec();
+                observations.push_back(Observation::from_row_slice(&bars));
+                if observations.len() > NUM_CHORDS {
+                    observations.pop_front();
+                }
+
                 if plot {
-                    Chart::new_with_y_range(100, 50, 0f32, 11f32, 0f32, 0.1f32)
+                    Chart::new(100, 50, 0f32, 11f32)
                         .lineplot(&textplots::Shape::Bars(
                             &bars
                                 .iter()
@@ -159,20 +257,28 @@ fn publish_chords_from_audio(
                         ))
                         .display();
                 }
-
-                let best_notes = bars
-                    .iter()
-                    .enumerate()
-                    .sorted_by(|(_, a), (_, b)| b.partial_cmp(a).unwrap())
-                    .take(4)
-                    .map(|(i, _)| i)
-                    .collect_vec();
-                if let Some(x) = guesser.guess(&best_notes) {
-                    tx.send(Event::Chord(x.clone(), guesser.chord_to_notes(&x)))
-                        .unwrap();
-                }
+                let chord = model
+                    .infer_viterbi(observations.make_contiguous())
+                    .last()
+                    .copied()
+                    .unwrap();
+                tx.send(Event::Chord(chord)).unwrap();
+                t_chords
+                    .send(WebPayload {
+                        full_q: FullQ {
+                            x: Note::iter().collect(),
+                            y: full_q,
+                        },
+                        bucketed_q: BucketedQ {
+                            y: bars,
+                            x: Note::iter().collect(),
+                        },
+                        chord,
+                        fft,
+                    })
+                    .unwrap();
             },
-            |err| eprintln!("an error occurred on the output audio stream: {}", err),
+            |err| eprintln!("an error occurred on the output audio stream: {err}"),
             None,
         )
         .unwrap();
@@ -248,68 +354,6 @@ fn get_destination(destination: &str) -> coremidi::Destination {
             )
         })
 }
-
-pub struct ChordGuesser {
-    chord_hash_to_name: HashMap<String, String>,
-    chord_name_to_notes: HashMap<String, Vec<usize>>,
-}
-impl ChordGuesser {
-    fn new() -> Self {
-        let chord_name_to_notes: HashMap<String, Vec<usize>> = NOTE_NAMES
-            .iter()
-            .enumerate()
-            .flat_map(|(i, chord)| {
-                [
-                    ("maj", vec![4, 7]),
-                    ("m", vec![3, 7]),
-                    ("5", vec![7]),
-                    ("7", vec![4, 7, 10]),
-                    ("maj7", vec![4, 7, 11]),
-                    ("m7", vec![3, 7, 10]),
-                    ("O", vec![]),
-                ]
-                .map(|(n, c)| {
-                    (
-                        chord.to_string() + n,
-                        [i].into_iter()
-                            .chain(c.into_iter().map(|x| i + x))
-                            .map(|f| f % 12)
-                            .collect_vec(),
-                    )
-                })
-            })
-            .collect();
-        let chord_hash_to_name = chord_name_to_notes
-            .iter()
-            .map(|(k, v)| (v.iter().sorted().join(","), k.clone()))
-            .collect();
-        Self {
-            chord_hash_to_name,
-            chord_name_to_notes,
-        }
-    }
-    pub fn guess(&self, notes: &[usize]) -> Option<String> {
-        [vec![0, 1, 2], vec![0, 1, 2, 3]]
-            .into_iter()
-            .flat_map(|idxs| {
-                self.chord_hash_to_name
-                    .get(&idxs.iter().map(|i| notes[*i]).sorted().join(","))
-            })
-            .next()
-            .cloned()
-    }
-
-    pub(crate) fn chord_to_notes(&self, x: &str) -> Vec<usize> {
-        self.chord_name_to_notes[x].clone()
-    }
-}
-
-impl Default for ChordGuesser {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 struct Player {
     _client: Client,
     output_port: OutputPort,
