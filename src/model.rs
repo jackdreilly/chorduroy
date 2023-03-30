@@ -3,6 +3,7 @@ use std::{fmt::Display, ops::Add};
 use itertools::Itertools;
 use nalgebra::{Const, SMatrix, SVector};
 use nalgebra_mvn::MultivariateNormal;
+use num::Float;
 use num_derive::FromPrimitive;
 use ordered_float::OrderedFloat;
 use serde::Serialize;
@@ -73,14 +74,6 @@ pub(crate) struct Model {
     hmm_params: HMMParams,
 }
 impl Model {
-    pub(crate) fn infer_all(&self, observation: &Observation) -> Vec<Chord> {
-        Chord::vec()
-            .into_iter()
-            .sorted_by_cached_key(|&chord| {
-                -OrderedFloat::from(self.gaussians[usize::from(chord)].log_pdf(observation))
-            })
-            .collect()
-    }
     pub(crate) fn infer_viterbi(&self, observations: &[Observation]) -> Vec<Chord> {
         let mut viterbi = SMatrix::<f32, NUM_CHORDS, NUM_CHORDS>::zeros();
         let mut backpointer = SMatrix::<usize, NUM_CHORDS, NUM_CHORDS>::zeros();
@@ -223,6 +216,8 @@ impl From<Chord> for MVGaussian {
             covariance[(i, j)] = value;
             covariance[(j, i)] = value;
         }
+        mean *= 0.1;
+        covariance *= 0.1;
         let mvn =
             nalgebra_mvn::MultivariateNormal::from_mean_and_covariance(&mean, &covariance).unwrap();
         Self { mvn }
@@ -233,7 +228,7 @@ impl From<Chord> for MVGaussian {
 fn transition_matrix() {
     let matrix = HMMParams::default().log_transition;
     for i in 0..NUM_CHORDS {
-        let row = matrix.row(i);
+        let row = matrix.row(i).map(|f| f.exp());
         assert!((row.sum() - 1.0).abs() < 1e-6);
         for &v in &row {
             assert!(v >= 0.0);
@@ -253,18 +248,23 @@ impl Default for HMMParams {
         let mut log_transition = MChords::zeros();
         for chord in Chord::vec() {
             let i = usize::from(chord);
-            for (step_base, Chord { note, flavor }) in
-                [(0f32, chord), (0.5f32, chord.relative_flavor())]
-            {
+            for (_step_base, Chord { note, flavor }) in [(0, chord), (1, chord.relative_flavor())] {
                 for cycle in [5, 7] {
                     for step in 0..7 {
                         log_transition[(
                             i,
-                            usize::from(Chord {
+                            Chord {
                                 note: note + cycle * step,
                                 flavor,
-                            }),
-                        )] = (-(step as f32 + step_base + 3.0) * 0.7).exp();
+                            }
+                            .into(),
+                        )] = if step < 3 {
+                            3.0
+                        } else if step < 5 {
+                            1.0
+                        } else {
+                            0.1
+                        };
                     }
                 }
             }
@@ -307,68 +307,6 @@ impl Add<u8> for Note {
 }
 
 #[test]
-fn plotter() {
-    use plotters::prelude::*;
-
-    const OUT_FILE_NAME: &str = "transition.png";
-    fn main() -> Result<(), Box<dyn std::error::Error>> {
-        let root = BitMapBackend::new(OUT_FILE_NAME, (1024, 768)).into_drawing_area();
-
-        root.fill(&WHITE)?;
-        let matrix = HMMParams::default().log_transition;
-        let n = matrix.nrows();
-
-        let mut chart = ChartBuilder::on(&root)
-            .caption("Matshow Example", ("sans-serif", 80))
-            .margin(5)
-            .top_x_label_area_size(40)
-            .y_label_area_size(40)
-            .build_cartesian_2d(0..n, n..0)?;
-        fn formatter(&x: &usize) -> String {
-            if x >= NUM_CHORDS {
-                "".to_string()
-            } else {
-                Chord::from(x).to_string()
-            }
-        }
-        chart
-            .configure_mesh()
-            .x_labels(n)
-            .y_labels(n)
-            .max_light_lines(4)
-            .x_label_offset(35)
-            .y_label_offset(25)
-            .disable_x_mesh()
-            .disable_y_mesh()
-            .label_style(("sans-serif", 12))
-            .x_label_formatter(&formatter)
-            .y_label_formatter(&formatter)
-            .draw()?;
-        let max = matrix.max() as f64;
-        chart.draw_series(
-            matrix
-                .row_iter()
-                .enumerate()
-                .flat_map(|(y, l)| {
-                    l.iter()
-                        .copied()
-                        .enumerate()
-                        .map(move |(x, v)| (x, y, v as f64))
-                        .collect_vec()
-                })
-                .map(|(x, y, v)| {
-                    Rectangle::new(
-                        [(x, y), (x + 1, y + 1)],
-                        HSLColor(0.0, 0.0, v / max).filled(),
-                    )
-                }),
-        )?;
-        Ok(())
-    }
-    main().unwrap();
-}
-
-#[test]
 fn test_mvn() {
     let chord: Chord = 0.into();
     let mut observation = Observation::zeros();
@@ -386,4 +324,25 @@ impl Display for Model {
         writeln!(f, "{}", self.hmm_params.log_initial)?;
         writeln!(f, "{}", self.hmm_params.log_transition)
     }
+}
+pub(crate) trait SortFloat<A, Fl: Float, F: Fn(&A) -> Fl> {
+    fn sorted_by_cached_float(self, f: F) -> std::vec::IntoIter<A>;
+}
+impl<A, Fl: Float, F: Fn(&A) -> Fl, T> SortFloat<A, Fl, F> for T
+where
+    T: Iterator<Item = A>,
+{
+    fn sorted_by_cached_float(self, f: F) -> std::vec::IntoIter<A> {
+        self.sorted_by_cached_key(|x| OrderedFloat(f(x)))
+    }
+}
+
+#[test]
+fn float_sorted() {
+    let a = [0.0, 4.2, 2.2]
+        .iter()
+        .sorted_by_cached_float(|&&f| f)
+        .copied()
+        .collect_vec();
+    assert_eq!(a, vec![0.0, 2.2, 4.2]);
 }

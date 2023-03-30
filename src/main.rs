@@ -2,6 +2,7 @@
 
 mod model;
 
+use aubio::Onset;
 use coremidi::{Client, Destination, Destinations, OutputPort, Protocol};
 use coremidi::{PacketBuffer, Sources};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -17,7 +18,7 @@ use std::collections::VecDeque;
 use std::f32::consts::PI;
 use std::io::{stdin, BufRead};
 use std::process::Command;
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 
 use clap::Parser;
@@ -41,6 +42,14 @@ struct WebPayload {
     bucketed_q: BucketedQ,
     chord: Chord,
     fft: Vec<f32>,
+    beat: bool,
+    observations: Observations,
+}
+#[derive(Serialize)]
+struct Observations {
+    x: Vec<Note>,
+    y: Vec<Vec<f32>>,
+    chords: Vec<Chord>,
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -85,6 +94,17 @@ fn main() {
     let (tx, rx) = mpsc::channel();
     let tx2 = tx.clone();
     let (t_chords, r_chords) = mpsc::channel::<WebPayload>();
+    let (t_audio, r_audio) = mpsc::channel::<Vec<f32>>();
+    let beat_mutex = Arc::new(Mutex::new(false));
+    let beat_mutex_beat = beat_mutex.clone();
+    thread::spawn(move || {
+        let mut beat = Onset::new(aubio::OnsetMode::SpecFlux, 1024, 512, 44100).unwrap();
+        for data in r_audio {
+            if beat.do_result(&data).unwrap() > 0.0 {
+                *beat_mutex_beat.lock().unwrap() = true;
+            }
+        }
+    });
     thread::spawn(move || {
         if chrome {
             Command::new("open")
@@ -115,13 +135,158 @@ fn main() {
         }
     });
     thread::spawn(move || {
-        publish_chords_from_audio(
-            audio.unwrap_or_else(|| "Black".into()),
-            milliseconds,
-            tx,
-            t_chords,
-            args,
-        );
+        {
+            let audio = audio.unwrap_or_else(|| "Black".into());
+            let Args {
+                max_buffer,
+                octaves,
+                low_octave,
+                plot,
+                ..
+            } = args;
+            let device = get_audio_device(audio);
+            let input_config = device.default_input_config().unwrap();
+            let mut config: StreamConfig = input_config.clone().into();
+            if max_buffer {
+                config.buffer_size = match &input_config.buffer_size() {
+                    SupportedBufferSize::Range { max, .. } => cpal::BufferSize::Fixed(*max),
+                    SupportedBufferSize::Unknown => cpal::BufferSize::Default,
+                };
+            }
+            let mut buffer: Vec<f32> = vec![];
+            let model = Model::default();
+            let mut observations: VecDeque<Observation> = VecDeque::new();
+            let max_size = config.sample_rate.0 as usize * milliseconds as usize / 1000;
+            let mut current_agg_count = 0.0;
+            let stream = device
+                .build_input_stream(
+                    &config,
+                    move |data: &[f32], _| {
+                        let data = data
+                            .chunks_exact(config.channels as usize)
+                            .map(|c| c.iter().sum::<f32>())
+                            .collect_vec();
+                        t_audio.send(data.clone()).unwrap();
+                        buffer.extend(data);
+                        if buffer.len() > max_size {
+                            buffer.drain(0..(buffer.len() - max_size));
+                        }
+                        let data = &buffer;
+                        let rate = config.sample_rate.0 as f32;
+                        let mut fft = data.iter().map_into().collect_vec();
+                        FftPlanner::new()
+                            .plan_fft_forward(data.len())
+                            .process(&mut fft);
+                        let fft = fft[0..data.len() / 2]
+                            .iter_mut()
+                            .take(250)
+                            .map(|f| f.norm())
+                            .collect_vec();
+                        let full_q = (0..12)
+                            .map(move |note| {
+                                (low_octave..octaves + low_octave)
+                                    .map(|octave| {
+                                        let bin = octave * 12 + note;
+                                        let f_k: f32 = 55f32 * 2.0_f32.powf(bin as f32 / 12_f32);
+                                        let n_k = (rate
+                                            / ((2.0_f32.powf(1.0 / 12f32) - 1.0) * f_k))
+                                            .min(data.len() as f32);
+                                        let factor = f_k * -2f32 * PI / rate;
+                                        let mut sum_real: f32 = 0.0;
+                                        let mut sum_imag: f32 = 0.0;
+
+                                        for j in 0..n_k.floor() as usize {
+                                            let j = j + (data.len() - n_k.floor() as usize) / 2;
+                                            let d = data[j];
+                                            let real_common = d / n_k;
+                                            let (sin, cos) = (factor
+                                                * (j as f32 + (n_k.floor() / 2f32)
+                                                    - data.len() as f32 / 2f32))
+                                                .sin_cos();
+                                            sum_real += real_common * cos;
+                                            sum_imag += real_common * sin;
+                                        }
+                                        sum_real.hypot(sum_imag) * (octave + 2) as f32
+                                    })
+                                    .collect_vec()
+                            })
+                            .collect_vec();
+                        let bars = full_q
+                            .iter()
+                            .map(|x| x.iter().sum::<f32>() / x.len() as f32)
+                            .collect_vec();
+                        let beat = {
+                            let mut lock = beat_mutex.lock().unwrap();
+                            let beat = *lock;
+                            *lock = false;
+                            beat
+                        };
+                        let observation = Observation::from_row_slice(&bars);
+                        if beat || current_agg_count > 20.0 {
+                            observations.push_back(observation);
+                            if observations.len() > NUM_CHORDS {
+                                observations.pop_front();
+                            }
+                            current_agg_count = 1.0;
+                        } else {
+                            match observations.back_mut() {
+                                Some(x) => {
+                                    current_agg_count += 1.0;
+                                    *x *= (current_agg_count - 1.0) / current_agg_count;
+                                    *x += observation / current_agg_count;
+                                }
+                                None => {
+                                    observations.push_back(observation);
+                                    current_agg_count = 1.0;
+                                }
+                            };
+                        }
+
+                        if plot {
+                            Chart::new(100, 50, 0f32, 11f32)
+                                .lineplot(&textplots::Shape::Bars(
+                                    &bars
+                                        .iter()
+                                        .enumerate()
+                                        .map(|(i, x)| (i as f32, *x))
+                                        .collect_vec(),
+                                ))
+                                .display();
+                        }
+                        let chords = model.infer_viterbi(observations.make_contiguous());
+                        let chord = chords[chords.len() - 1];
+
+                        tx.send(Event::Chord(chord)).unwrap();
+                        t_chords
+                            .send(WebPayload {
+                                full_q: FullQ {
+                                    x: Note::iter().collect(),
+                                    y: full_q,
+                                },
+                                bucketed_q: BucketedQ {
+                                    y: bars,
+                                    x: Note::iter().collect(),
+                                },
+                                chord,
+                                fft,
+                                beat,
+                                observations: Observations {
+                                    x: Note::iter().collect(),
+                                    y: observations
+                                        .iter()
+                                        .map(|x| x.iter().copied().collect())
+                                        .collect(),
+                                    chords,
+                                },
+                            })
+                            .unwrap();
+                    },
+                    |err| eprintln!("an error occurred on the output audio stream: {err}"),
+                    None,
+                )
+                .unwrap();
+            stream.play().unwrap();
+        };
         block();
     });
 
@@ -142,7 +307,6 @@ fn output_remapped_midi_notes(destination: Option<String>, rx: mpsc::Receiver<Ev
                 active_chord = chord;
             }
             Event::Note(on, note) => {
-                dbg!(on, note, active_chord);
                 if !on {
                     player.play_off(midi_note_remapping_history[note as usize]);
                     continue;
@@ -159,130 +323,6 @@ fn output_remapped_midi_notes(destination: Option<String>, rx: mpsc::Receiver<Ev
             }
         }
     }
-}
-
-fn publish_chords_from_audio(
-    audio: String,
-    milliseconds: u32,
-    tx: mpsc::Sender<Event>,
-    t_chords: mpsc::Sender<WebPayload>,
-    Args {
-        max_buffer,
-        octaves,
-        low_octave,
-        plot,
-        ..
-    }: Args,
-) {
-    let device = get_audio_device(audio);
-    let input_config = device.default_input_config().unwrap();
-    let mut config: StreamConfig = input_config.clone().into();
-    if max_buffer {
-        config.buffer_size = match &input_config.buffer_size() {
-            SupportedBufferSize::Range { max, .. } => cpal::BufferSize::Fixed(*max),
-            SupportedBufferSize::Unknown => cpal::BufferSize::Default,
-        };
-    }
-    let mut buffer: Vec<f32> = vec![];
-    let model = Model::default();
-    let mut observations: VecDeque<Observation> = VecDeque::new();
-    let stream = device
-        .build_input_stream(
-            &config,
-            move |data: &[f32], _| {
-                buffer.reserve(data.len() / config.channels as usize);
-                data.chunks_exact(config.channels as usize)
-                    .map(|c| c.iter().sum::<f32>())
-                    .collect_into(&mut buffer);
-                let max_size = config.sample_rate.0 as usize * milliseconds as usize / 1000;
-                if buffer.len() > max_size {
-                    buffer.drain(0..data.len() / config.channels as usize);
-                }
-                let data = &buffer;
-                let rate = config.sample_rate.0 as f32;
-                let mut fft = data.iter().map_into().collect_vec();
-                FftPlanner::new()
-                    .plan_fft_forward(data.len())
-                    .process(&mut fft);
-                let fft = fft[0..data.len() / 2]
-                    .iter_mut()
-                    .take(250)
-                    .map(|f| f.norm())
-                    .collect_vec();
-                let full_q = (0..12)
-                    .map(move |note| {
-                        (low_octave..octaves + low_octave)
-                            .map(|octave| {
-                                let bin = octave * 12 + note;
-                                let f_k: f32 = 55f32 * 2.0_f32.powf(bin as f32 / 12_f32);
-                                let n_k = (rate / ((2.0_f32.powf(1.0 / 12f32) - 1.0) * f_k))
-                                    .min(data.len() as f32);
-                                let factor = f_k * -2f32 * PI / rate;
-                                let mut sum_real: f32 = 0.0;
-                                let mut sum_imag: f32 = 0.0;
-
-                                for j in 0..n_k.floor() as usize {
-                                    let j = j + (data.len() - n_k.floor() as usize) / 2;
-                                    let d = data[j];
-                                    let real_common = d / n_k;
-                                    let (sin, cos) = (factor
-                                        * (j as f32 + (n_k.floor() / 2f32)
-                                            - data.len() as f32 / 2f32))
-                                        .sin_cos();
-                                    sum_real += real_common * cos;
-                                    sum_imag += real_common * sin;
-                                }
-                                sum_real.hypot(sum_imag) * (octave + 2) as f32
-                            })
-                            .collect_vec()
-                    })
-                    .collect_vec();
-                let bars = full_q
-                    .iter()
-                    .map(|x| x.iter().sum::<f32>() / x.len() as f32)
-                    .collect_vec();
-                observations.push_back(Observation::from_row_slice(&bars));
-                if observations.len() > NUM_CHORDS {
-                    observations.pop_front();
-                }
-
-                if plot {
-                    Chart::new(100, 50, 0f32, 11f32)
-                        .lineplot(&textplots::Shape::Bars(
-                            &bars
-                                .iter()
-                                .enumerate()
-                                .map(|(i, x)| (i as f32, *x))
-                                .collect_vec(),
-                        ))
-                        .display();
-                }
-                let chord = model
-                    .infer_viterbi(observations.make_contiguous())
-                    .last()
-                    .copied()
-                    .unwrap();
-                tx.send(Event::Chord(chord)).unwrap();
-                t_chords
-                    .send(WebPayload {
-                        full_q: FullQ {
-                            x: Note::iter().collect(),
-                            y: full_q,
-                        },
-                        bucketed_q: BucketedQ {
-                            y: bars,
-                            x: Note::iter().collect(),
-                        },
-                        chord,
-                        fft,
-                    })
-                    .unwrap();
-            },
-            |err| eprintln!("an error occurred on the output audio stream: {err}"),
-            None,
-        )
-        .unwrap();
-    stream.play().unwrap();
 }
 
 fn publish_midi_in_events(

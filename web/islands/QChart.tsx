@@ -29,31 +29,42 @@ interface Chord {
   flavor: Flavor;
   note: Note;
 }
+type Observations = {
+  x: Note[];
+  y: number[][];
+  chords: Chord[];
+};
+type FullQ = {
+  x: Note[];
+  y: number[][];
+};
 interface Payload {
-  full_q: {
-    x: Note[];
-    y: number[][];
-  };
+  full_q: FullQ;
   bucketed_q: {
     x: Note[];
     y: number[];
   };
   chord: Chord;
   fft: number[];
+  beat: boolean;
+  observations: Observations;
 }
 export default function QChart() {
   const [zoomRaw, setZoom] = useState(1);
   const [boost, setBoost] = useState(5);
   const [auto, setAuto] = useState(false);
   const [timeline, setTimeline] = useState<Timeline>([]);
-  const [{ chord, bucketed_q, full_q, fft }, setState] = useState<
-    Payload
-  >({
-    full_q: { x: [], y: [] },
-    bucketed_q: { x: [], y: [] },
-    fft: [],
-    chord: { flavor: Flavor.Major, note: Note.C },
-  });
+  const [{ chord, bucketed_q, full_q, fft, beat, observations }, setState] =
+    useState<
+      Payload
+    >({
+      full_q: { x: [], y: [] },
+      bucketed_q: { x: [], y: [] },
+      fft: [],
+      chord: { flavor: Flavor.Major, note: Note.C },
+      beat: false,
+      observations: { x: [], y: [], chords: [] },
+    });
   useEffect(() => {
     const ws: WebSocketClient = new StandardWebSocketClient(endpoint);
     ws.on("message", (m) => {
@@ -87,6 +98,13 @@ export default function QChart() {
         />
         <label>Booster</label>
       </div>
+      {
+        <div
+          class="h-4 w-4 rounded-full shadow-md border-1 border-black"
+          style={{ backgroundColor: beat ? "red" : "white" }}
+        >
+        </div>
+      }
       <div>
         <input
           class="m-10"
@@ -96,7 +114,7 @@ export default function QChart() {
         />
         <label>Auto</label>
       </div>
-      <div class="flex flex-row w-full m-10 h-[200px]">
+      <div class="flex flex-row w-full m-10">
         {full_q.y.map((v, i) => (
           <div class="flex flex-1 flex-col">
             {(() => {
@@ -128,6 +146,31 @@ export default function QChart() {
                 {full_q.x[i]}
               </div>
             ))}
+          </div>
+        ))}
+      </div>
+      <h2 class="m-2 p-2 text-lg">Observations</h2>
+      <div class="flex flex-row w-full m-10">
+        {observations.y.map((v, i) => (
+          <div class="flex flex-1 flex-col">
+            {v.map((x) => Math.min(1, Math.max(0, x * boost))).map((
+              value,
+              j,
+            ) => (
+              <div
+                class="text-center flex-1 border-1 border-black h-[10em] rounded text-black"
+                style={{
+                  backgroundColor: `hsl(${380 * (.5 + .5 * value)},${
+                    50 + 50 * value
+                  }%, ${100 - 50 * value}%)`,
+                }}
+              >
+                {observations.x[j]}
+              </div>
+            ))}
+            <div class="text-center flex-1 border-1 border-black h-[10em] rounded text-black">
+              {chordString(observations.chords[i])}
+            </div>
           </div>
         ))}
       </div>
@@ -185,10 +228,16 @@ function TimelineComponent({ timeline }: { timeline: Timeline }) {
             class="font-bold font-mono absolute m-1 p-1 bg-white rounded-md shadow-md"
             style={{ right: (now - time) / 10, z: i }}
           >
-            {`${chord.note}${chord.flavor.toString() === "Major" ? "" : "m"}`}
+            {chordString(chord)}
           </li>
         ))}
       </ul>
     </div>
   );
+}
+
+function chordString(
+  chord: Chord,
+): import("https://esm.sh/v113/preact@10.11.0/src/index").ComponentChildren {
+  return `${chord.note}${chord.flavor.toString() === "Major" ? "" : "m"}`;
 }
