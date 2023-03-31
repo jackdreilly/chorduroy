@@ -241,6 +241,7 @@ fn main() {
                                 }
                             };
                         }
+                        observations.back_mut().unwrap().normalize_mut();
 
                         if plot {
                             Chart::new(100, 50, 0f32, 11f32)

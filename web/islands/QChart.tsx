@@ -2,7 +2,7 @@ import {
   StandardWebSocketClient,
   WebSocketClient,
 } from "https://deno.land/x/websocket@v0.1.4/mod.ts";
-import { useCallback, useEffect, useMemo, useState } from "preact/hooks";
+import { useEffect, useState } from "preact/hooks";
 const endpoint = "ws://127.0.0.1:1234";
 enum Note {
   "C",
@@ -51,8 +51,6 @@ interface Payload {
 }
 export default function QChart() {
   const [zoomRaw, setZoom] = useState(1);
-  const [boost, setBoost] = useState(5);
-  const [auto, setAuto] = useState(false);
   const [timeline, setTimeline] = useState<Timeline>([]);
   const [{ chord, bucketed_q, full_q, fft, beat, observations }, setState] =
     useState<
@@ -82,38 +80,9 @@ export default function QChart() {
     setTimeline((t) => [...t, { chord, time: Date.now() }]);
   }, [timeline, chord]);
   const zoom = Math.min(zoomRaw, 10000 / fft.length);
+  const boost = 2;
   return (
     <>
-      <div>
-        <input
-          class="m-10"
-          type="range"
-          min={0.1}
-          step={0.1}
-          max={15}
-          value={boost}
-          onInput={({ target: { valueAsNumber } }) => {
-            setBoost((_) => valueAsNumber);
-          }}
-        />
-        <label>Booster</label>
-      </div>
-      {
-        <div
-          class="h-4 w-4 rounded-full shadow-md border-1 border-black"
-          style={{ backgroundColor: beat ? "red" : "white" }}
-        >
-        </div>
-      }
-      <div>
-        <input
-          class="m-10"
-          type="checkbox"
-          checked={auto}
-          onInput={() => setAuto((c) => !c)}
-        />
-        <label>Auto</label>
-      </div>
       <div class="flex flex-row w-full m-10">
         {full_q.y.map((v, i) => (
           <div class="flex flex-1 flex-col">
@@ -168,7 +137,7 @@ export default function QChart() {
                 {observations.x[j]}
               </div>
             ))}
-            <div class="text-center flex-1 border-1 border-black h-[10em] rounded text-black">
+            <div class="text-center font-bold flex-1 border-1 border-black h-[10em] rounded text-black">
               {chordString(observations.chords[i])}
             </div>
           </div>
