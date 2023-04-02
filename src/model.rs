@@ -1,4 +1,7 @@
-use std::{fmt::Display, ops::Add};
+use std::{
+    fmt::{Debug, Display},
+    ops::Add,
+};
 
 use itertools::Itertools;
 use nalgebra::{Const, SMatrix, SVector};
@@ -108,6 +111,7 @@ impl Model {
                 backpointer[(t, i)] = argmax;
             }
         }
+        println!("{viterbi}");
         let mut max = f32::NEG_INFINITY;
         let mut argmax = 0;
         for i in 0..NUM_CHORDS {
@@ -177,11 +181,19 @@ pub(crate) type Observation = VNotes;
 #[derive(Debug)]
 struct MVGaussian {
     mvn: MultivariateNormal<f32, Const<NUM_NOTES>>,
+    chord: Chord,
 }
 impl MVGaussian {
     fn log_pdf(&self, observation: &Observation) -> f32 {
+        let mut observation = *observation;
+        observation
+            .column_mut(0)
+            .data
+            .into_slice_mut()
+            .rotate_left(self.chord.note as usize);
         self.mvn
             .logpdf(&observation.fixed_resize::<NUM_NOTES, 1>(0.0).transpose())[(0, 0)]
+            .clamp(-1e10, 1e10)
     }
 }
 
@@ -198,29 +210,24 @@ impl From<&usize> for Chord {
 
 impl From<Chord> for MVGaussian {
     fn from(chord: Chord) -> Self {
-        let mut mean = VNotes::zeros();
-        let mut covariance = MNotes::zeros();
-        let notes = Intervals::from(chord);
-        for note in Note::iter() {
-            let note = note as usize;
-            if notes.contains(&(note as u8)) {
-                mean[note] = 1.0;
-                covariance[(note, note)] = 1.0;
-            } else {
-                covariance[(note, note)] = 0.2;
-            }
+        match chord.flavor {
+            Flavor::Major => Self {
+                mvn: nalgebra_mvn::MultivariateNormal::from_mean_and_covariance(
+                    &MAJOR_MEANS,
+                    &MAJOR_COV,
+                )
+                .unwrap(),
+                chord,
+            },
+            Flavor::Minor => Self {
+                mvn: nalgebra_mvn::MultivariateNormal::from_mean_and_covariance(
+                    &MINOR_MEANS,
+                    &MINOR_COV,
+                )
+                .unwrap(),
+                chord,
+            },
         }
-        for (i, j, value) in [(0, 2, 0.8), (1, 2, 0.8), (0, 1, 0.6)] {
-            let i = notes[i] as usize;
-            let j = notes[j] as usize;
-            covariance[(i, j)] = value;
-            covariance[(j, i)] = value;
-        }
-        mean *= 0.1;
-        covariance *= 0.1;
-        let mvn =
-            nalgebra_mvn::MultivariateNormal::from_mean_and_covariance(&mean, &covariance).unwrap();
-        Self { mvn }
     }
 }
 
@@ -345,4 +352,27 @@ fn float_sorted() {
         .copied()
         .collect_vec();
     assert_eq!(a, vec![0.0, 2.2, 4.2]);
+}
+
+use lazy_static::lazy_static;
+
+lazy_static! {
+    static ref MAJOR_MEANS: VNotes =
+        VNotes::from_vec(serde_json::from_str(include_str!("../data/maj_mean.json")).unwrap());
+    static ref MINOR_MEANS: VNotes =
+        VNotes::from_vec(serde_json::from_str(include_str!("../data/min_mean.json")).unwrap());
+    static ref MAJOR_COV: MNotes = MNotes::from_vec(
+        serde_json::from_str::<Vec<Vec<f32>>>(include_str!("../data/maj_cov.json"))
+            .unwrap()
+            .into_iter()
+            .flatten()
+            .collect()
+    );
+    static ref MINOR_COV: MNotes = MNotes::from_vec(
+        serde_json::from_str::<Vec<Vec<f32>>>(include_str!("../data/min_cov.json"))
+            .unwrap()
+            .into_iter()
+            .flatten()
+            .collect()
+    );
 }

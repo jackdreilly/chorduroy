@@ -285,6 +285,7 @@ dependencies = [
  "coremidi",
  "cpal",
  "itertools",
+ "lazy_static",
  "nalgebra",
  "nalgebra-mvn",
  "num",
