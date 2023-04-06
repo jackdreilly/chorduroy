@@ -12,7 +12,7 @@ use serde::Serialize;
 use strum::IntoEnumIterator;
 use websocket::Message;
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::f32::consts::PI;
 use std::io::{stdin, BufRead};
 use std::process::Command;
@@ -23,6 +23,13 @@ use clap::Parser;
 use itertools::Itertools;
 
 use crate::model::NUM_CHORDS;
+
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum NoteMode {
+    Chord,
+    Continuous,
+    Chromatic,
+}
 
 #[derive(Serialize)]
 struct FullQ {
@@ -67,7 +74,7 @@ struct Args {
     audio: Option<String>,
     #[arg(short, long, default_value_t = false)]
     plot: bool,
-    #[arg(long, default_value_t = false)]
+    #[arg(long, default_value_t = true)]
     max_buffer: bool,
     #[arg(short, long, default_value_t = false)]
     chrome: bool,
@@ -76,8 +83,10 @@ struct Args {
 #[derive(Debug)]
 enum Event {
     Note(bool, u8),
-    Chord(Chord),
+    Chords(Chords),
+    NoteMode(NoteMode),
 }
+type Chords = Vec<Chord>;
 
 fn main() {
     let args = Args::parse();
@@ -102,6 +111,17 @@ fn main() {
                 *beat_mutex_beat.lock().unwrap() = true;
             }
         }
+    });
+    let tx_input = tx.clone();
+    thread::spawn(move || loop {
+        match stdin().lock().lines().next().unwrap().unwrap().as_str() {
+            "c" => tx_input.send(Event::NoteMode(NoteMode::Chord)).unwrap(),
+            "a" => tx_input.send(Event::NoteMode(NoteMode::Chromatic)).unwrap(),
+            "n" => tx_input
+                .send(Event::NoteMode(NoteMode::Continuous))
+                .unwrap(),
+            _ => {}
+        };
     });
     thread::spawn(move || {
         if chrome {
@@ -164,6 +184,12 @@ fn main() {
                             .chunks_exact(config.channels as usize)
                             .map(|c| c.iter().sum::<f32>())
                             .collect_vec();
+                        if data.iter().map(|f| f.abs()).sum::<f32>() < 1e-1 {
+                            observations.clear();
+                            observations.push_back(default());
+                            current_agg_count = 0.0;
+                            buffer.clear();
+                        }
                         t_audio.send(data.clone()).unwrap();
                         buffer.extend(data);
                         buffer.drain(0..buffer.len().saturating_sub(max_size));
@@ -211,10 +237,13 @@ fn main() {
                         if observations.len() > NUM_CHORDS {
                             observations.pop_front();
                         }
+                        if current_agg_count < 3.0 {
+                            return;
+                        }
                         let chords = model.infer_viterbi(observations.make_contiguous());
                         let chord = chords[chords.len() - 1];
 
-                        tx.send(Event::Chord(chord)).unwrap();
+                        tx.send(Event::Chords(chords.clone())).unwrap();
                         t_chords
                             .send(WebPayload {
                                 full_q: FullQ {
@@ -264,26 +293,48 @@ fn main() {
 fn output_remapped_midi_notes(destination: Option<String>, rx: mpsc::Receiver<Event>) {
     let player = Player::new(&destination.unwrap_or_else(|| "Garage".into()));
     let mut active_chord = Chord::from(0);
+    let mut scale = Scale(Note::C);
     let mut midi_note_remapping_history = vec![0; 256];
+    let mut note_mode = NoteMode::Chord;
     for event in rx {
         match event {
-            Event::Chord(chord) => {
-                active_chord = chord;
+            Event::NoteMode(mode) => {
+                note_mode = mode;
+            }
+            Event::Chords(chords) => {
+                active_chord = chords[chords.len() - 1];
+                scale = chords.into();
             }
             Event::Note(on, note) => {
                 if !on {
                     player.play_off(midi_note_remapping_history[note as usize]);
                     continue;
                 }
-                let new_note = active_chord
-                    .notes()
-                    .iter()
-                    .map(|&n| n as u8 + 9)
-                    .min_by_key(|f| f.abs_diff(note) % 12)
-                    .unwrap()
-                    + (note - (note % 12));
+                let new_note = match note_mode {
+                    NoteMode::Chord => (note - 3..=note)
+                        .rev()
+                        .find(|note| {
+                            active_chord
+                                .notes()
+                                .iter()
+                                .map(|x| (*x as u8 + 9) % 12)
+                                .contains(&(note % 12))
+                        })
+                        .unwrap_or(note),
+                    _ => {
+                        let octave = (note / 12) * 12;
+                        let index = if note_mode == NoteMode::Chromatic {
+                            note % 12
+                        } else {
+                            [0, 2, 2, 4, 4, 5, 7, 7, 9, 9, 11, 11][(note % 12) as usize]
+                        };
+                        let scale_offset = scale.0 as u8;
+                        octave + index + scale_offset + 9
+                    }
+                };
                 midi_note_remapping_history[note as usize] = new_note;
                 player.play_on(new_note);
+                dbg!(note, new_note, active_chord, scale, note_mode);
             }
         }
     }
@@ -394,3 +445,52 @@ impl Player {
 
 type Features = Observation;
 type F = f32;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Scale(Note);
+impl From<Chords> for Scale {
+    fn from(chords: Chords) -> Self {
+        let mut candidates = (0..12).collect_vec();
+        let mut all_notes = HashSet::<Note>::new();
+        for chord in chords.into_iter().rev() {
+            all_notes.extend(chord.notes());
+            let remaining_candidates = candidates
+                .iter()
+                .copied()
+                .filter(|scale| {
+                    for &note in all_notes.iter() {
+                        if ![0, 2, 4, 5, 7, 9, 11].contains(&((note as u8 + 12 - scale) % 12)) {
+                            return false;
+                        }
+                    }
+                    true
+                })
+                .collect_vec();
+            match remaining_candidates.len() {
+                0 => return candidates[0].into(),
+                1 => return remaining_candidates[0].into(),
+                _ => {
+                    candidates = remaining_candidates;
+                }
+            }
+        }
+        candidates[0].into()
+    }
+}
+
+impl From<u8> for Scale {
+    fn from(x: u8) -> Self {
+        Self(Note::from_repr(x).unwrap())
+    }
+}
+
+impl Scale {
+    fn notes(&self) -> [Note; 7] {
+        [0, 2, 4, 5, 7, 9, 11]
+            .into_iter()
+            .map(|x| self.0 + x)
+            .collect_vec()
+            .try_into()
+            .unwrap()
+    }
+}

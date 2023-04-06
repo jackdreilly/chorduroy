@@ -36,7 +36,7 @@ impl From<Flavor> for Intervals {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub(crate) struct Chord {
     flavor: Flavor,
-    note: Note,
+    pub(crate) note: Note,
 }
 impl From<Chord> for usize {
     fn from(chord: Chord) -> Self {
@@ -55,7 +55,7 @@ impl From<Chord> for Intervals {
     }
 }
 
-#[derive(Clone, Copy, EnumIter, FromPrimitive, Debug, PartialEq, Eq, FromRepr, Serialize)]
+#[derive(Clone, Copy, EnumIter, FromPrimitive, Debug, PartialEq, Eq, FromRepr, Serialize, Hash)]
 #[repr(u8)]
 pub(crate) enum Note {
     A,
@@ -111,7 +111,7 @@ impl Model {
                 backpointer[(t, i)] = argmax;
             }
         }
-        println!("{viterbi}");
+        // println!("{viterbi}");
         let mut max = f32::NEG_INFINITY;
         let mut argmax = 0;
         for i in 0..NUM_CHORDS {
@@ -149,6 +149,13 @@ impl Chord {
         Note::iter()
             .flat_map(|note| Flavor::iter().map(move |flavor| Chord { flavor, note }))
             .collect()
+    }
+
+    fn relative_major(&self) -> Chord {
+        match self.flavor {
+            Flavor::Major => *self,
+            Flavor::Minor => self.relative_flavor(),
+        }
     }
 
     fn relative_flavor(&self) -> Chord {
@@ -252,33 +259,18 @@ struct HMMParams {
 impl Default for HMMParams {
     fn default() -> Self {
         let log_initial = VChords::repeat((NUM_CHORDS as f32).recip().ln());
-        let mut log_transition = MChords::zeros();
-        for chord in Chord::vec() {
-            let i = usize::from(chord);
-            for (_step_base, Chord { note, flavor }) in [(0, chord), (1, chord.relative_flavor())] {
-                for cycle in [5, 7] {
-                    for step in 0..7 {
-                        log_transition[(
-                            i,
-                            Chord {
-                                note: note + cycle * step,
-                                flavor,
-                            }
-                            .into(),
-                        )] = if step < 3 {
-                            3.0
-                        } else if step < 5 {
-                            1.0
-                        } else {
-                            0.1
-                        };
-                    }
-                }
-            }
-        }
-        for mut row in log_transition.row_iter_mut() {
+        let mut log_transition = MChords::identity() * 0.2 + MChords::repeat(1e-3);
+        for (i, mut row) in log_transition.row_iter_mut().enumerate() {
+            let mut setter = |j, v| row[(i + j + (i % 2) * 5) % NUM_CHORDS] = v;
+            setter(0, 0.6);
+            setter(5, 0.4);
+            setter(9, 0.3);
+            setter(10, 0.5);
+            setter(14, 0.5);
+            setter(17, 0.5);
+
             row /= row.sum();
-            row.apply(|f| *f = f.ln());
+            row.iter_mut().for_each(|f| *f = f.ln());
         }
         Self {
             log_initial,
