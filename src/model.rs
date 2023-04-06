@@ -111,6 +111,7 @@ impl Model {
                 backpointer[(t, i)] = argmax;
             }
         }
+        println!("{viterbi}");
         let mut max = f32::NEG_INFINITY;
         let mut argmax = 0;
         for i in 0..NUM_CHORDS {
@@ -209,37 +210,19 @@ impl From<&usize> for Chord {
 
 impl From<Chord> for MVGaussian {
     fn from(chord: Chord) -> Self {
-        let mut covariance = MNotes::identity() * 0.2;
-        let color_note = if chord.flavor == Flavor::Major { 4 } else { 3 };
-        for note in [0, 7, color_note] {
-            covariance[(note, note)] = 1.0;
-        }
-        covariance[(0, 7)] = 0.8;
-        covariance[(7, 0)] = 0.8;
-        covariance[(color_note, 7)] = 0.8;
-        covariance[(7, color_note)] = 0.8;
-        covariance[(0, color_note)] = 0.6;
-        covariance[(color_note, 0)] = 0.6;
-        covariance *= 0.1;
-        let mut mean = VNotes::from_element(0.1);
-        mean[0] = 1.0;
-        mean[7] = 0.8;
-        mean[color_note] = 0.4;
-        mean.normalize_mut();
-
         match chord.flavor {
             Flavor::Major => Self {
                 mvn: nalgebra_mvn::MultivariateNormal::from_mean_and_covariance(
-                    &mean,
-                    &covariance,
+                    &MAJOR_MEANS,
+                    &MAJOR_COV,
                 )
                 .unwrap(),
                 chord,
             },
             Flavor::Minor => Self {
                 mvn: nalgebra_mvn::MultivariateNormal::from_mean_and_covariance(
-                    &mean,
-                    &covariance,
+                    &MINOR_MEANS,
+                    &MINOR_COV,
                 )
                 .unwrap(),
                 chord,
