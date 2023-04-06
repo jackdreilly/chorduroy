@@ -1,4 +1,4 @@
-#![feature(iter_collect_into)]
+#![feature(iter_collect_into, default_free_fn)]
 
 mod model;
 
@@ -8,10 +8,8 @@ use coremidi::{PacketBuffer, Sources};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{default_host, StreamConfig, SupportedBufferSize};
 use model::{Chord, Model, Note, Observation};
-use rustfft::FftPlanner;
 use serde::Serialize;
 use strum::IntoEnumIterator;
-use textplots::{Chart, Plot};
 use websocket::Message;
 
 use std::collections::VecDeque;
@@ -19,7 +17,7 @@ use std::f32::consts::PI;
 use std::io::{stdin, BufRead};
 use std::process::Command;
 use std::sync::{mpsc, Arc, Mutex};
-use std::thread;
+use std::{default::default, thread};
 
 use clap::Parser;
 use itertools::Itertools;
@@ -153,9 +151,9 @@ fn main() {
                     SupportedBufferSize::Unknown => cpal::BufferSize::Default,
                 };
             }
-            let mut buffer: Vec<f32> = vec![];
+            let mut buffer: VecDeque<f32> = VecDeque::new();
             let model = Model::default();
-            let mut observations: VecDeque<Observation> = VecDeque::new();
+            let mut observations: VecDeque<Observation> = [default()].into();
             let max_size = config.sample_rate.0 as usize * milliseconds as usize / 1000;
             let mut current_agg_count = 0.0;
             let stream = device
@@ -168,91 +166,50 @@ fn main() {
                             .collect_vec();
                         t_audio.send(data.clone()).unwrap();
                         buffer.extend(data);
-                        if buffer.len() > max_size {
-                            buffer.drain(0..(buffer.len() - max_size));
-                        }
-                        let data = &buffer;
-                        let rate = config.sample_rate.0 as f32;
-                        let mut fft = data.iter().map_into().collect_vec();
-                        FftPlanner::new()
-                            .plan_fft_forward(data.len())
-                            .process(&mut fft);
-                        let fft = fft[0..data.len() / 2]
-                            .iter_mut()
-                            .take(250)
-                            .map(|f| f.norm())
-                            .collect_vec();
-                        let full_q = (0..12)
-                            .map(move |note| {
-                                (low_octave..octaves + low_octave)
-                                    .map(|octave| {
-                                        let bin = octave * 12 + note;
-                                        let f_k: f32 = 55f32 * 2.0_f32.powf(bin as f32 / 12_f32);
-                                        let n_k = (rate
-                                            / ((2.0_f32.powf(1.0 / 12f32) - 1.0) * f_k))
-                                            .min(data.len() as f32);
-                                        let factor = f_k * -2f32 * PI / rate;
-                                        let mut sum_real: f32 = 0.0;
-                                        let mut sum_imag: f32 = 0.0;
-
-                                        for j in 0..n_k.floor() as usize {
-                                            let j = j + (data.len() - n_k.floor() as usize) / 2;
-                                            let d = data[j];
-                                            let real_common = d / n_k;
-                                            let (sin, cos) = (factor
-                                                * (j as f32 + (n_k.floor() / 2f32)
-                                                    - data.len() as f32 / 2f32))
-                                                .sin_cos();
-                                            sum_real += real_common * cos;
-                                            sum_imag += real_common * sin;
-                                        }
-                                        sum_real.hypot(sum_imag) * (octave + 2) as f32
-                                    })
-                                    .collect_vec()
-                            })
-                            .collect_vec();
-                        let bars = full_q
-                            .iter()
-                            .map(|x| x.iter().sum::<f32>() / x.len() as f32)
-                            .collect_vec();
+                        buffer.drain(0..buffer.len().saturating_sub(max_size));
                         let beat = {
                             let mut lock = beat_mutex.lock().unwrap();
                             let beat = *lock;
                             *lock = false;
                             beat
                         };
-                        let observation = Observation::from_row_slice(&bars);
-                        if beat || current_agg_count > 20.0 {
-                            observations.push_back(observation);
-                            if observations.len() > NUM_CHORDS {
-                                observations.pop_front();
+                        let mut new_feature: Features = default();
+                        for note in 0..12 {
+                            for octave in low_octave..(low_octave + octaves) {
+                                let bin = octave * 12 + note;
+                                let f_k: F = 55.0 * 2.0f32.powf(bin as F / 12.0);
+                                let n_k = (config.sample_rate.0 as F
+                                    / (((2.0 as F).powf(1.0 / 12.0) - 1.0) * f_k))
+                                    .min(buffer.len() as F);
+                                let factor = f_k * -2.0 * (PI as F) / config.sample_rate.0 as F;
+                                let mut sum_real: F = 0.0;
+                                let mut sum_imag: F = 0.0;
+                                for j in 0..n_k.floor() as usize {
+                                    let j = j + (buffer.len() - n_k.floor() as usize) / 2;
+                                    let d = buffer[j];
+                                    let real_common = d / n_k;
+                                    let (sin, cos) = (factor
+                                        * (j as F + (n_k.floor() / 2.0) - buffer.len() as F / 2.0))
+                                        .sin_cos();
+                                    sum_real += real_common * cos;
+                                    sum_imag += real_common * sin;
+                                }
+                                new_feature[note as usize] += sum_real.hypot(sum_imag);
                             }
+                        }
+                        new_feature.normalize_mut();
+                        if beat {
+                            observations.push_back(new_feature);
                             current_agg_count = 1.0;
                         } else {
-                            match observations.back_mut() {
-                                Some(x) => {
-                                    current_agg_count += 1.0;
-                                    *x *= (current_agg_count - 1.0) / current_agg_count;
-                                    *x += observation / current_agg_count;
-                                }
-                                None => {
-                                    observations.push_back(observation);
-                                    current_agg_count = 1.0;
-                                }
-                            };
+                            let features = observations.back_mut().unwrap();
+                            *features *= current_agg_count;
+                            *features += new_feature;
+                            (*features).normalize_mut();
+                            current_agg_count += 1.0;
                         }
-                        observations.back_mut().unwrap().normalize_mut();
-
-                        if plot {
-                            Chart::new(100, 50, 0f32, 11f32)
-                                .lineplot(&textplots::Shape::Bars(
-                                    &bars
-                                        .iter()
-                                        .enumerate()
-                                        .map(|(i, x)| (i as f32, *x))
-                                        .collect_vec(),
-                                ))
-                                .display();
+                        if observations.len() > NUM_CHORDS {
+                            observations.pop_front();
                         }
                         let chords = model.infer_viterbi(observations.make_contiguous());
                         let chord = chords[chords.len() - 1];
@@ -262,14 +219,20 @@ fn main() {
                             .send(WebPayload {
                                 full_q: FullQ {
                                     x: Note::iter().collect(),
-                                    y: full_q,
+                                    y: default(),
                                 },
                                 bucketed_q: BucketedQ {
-                                    y: bars,
+                                    y: observations
+                                        .iter()
+                                        .last()
+                                        .unwrap()
+                                        .into_iter()
+                                        .copied()
+                                        .collect_vec(),
                                     x: Note::iter().collect(),
                                 },
                                 chord,
-                                fft,
+                                fft: default(),
                                 beat,
                                 observations: Observations {
                                     x: Note::iter().collect(),
@@ -428,3 +391,6 @@ impl Player {
             .unwrap();
     }
 }
+
+type Features = Observation;
+type F = f32;
