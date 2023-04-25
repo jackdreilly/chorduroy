@@ -9,7 +9,7 @@ use coremidi::{PacketBuffer, Sources};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{default_host, StreamConfig, SupportedBufferSize};
 use model::{Model, Observation};
-use num::ToPrimitive;
+use num::{FromPrimitive, ToPrimitive};
 use serde::{Deserialize, Serialize};
 use strum::EnumCount;
 use websocket::Message;
@@ -234,7 +234,7 @@ fn main() {
                             }
                         }
                         new_feature.normalize_mut();
-                        if beat {
+                        if beat && (observations.len() > 1 || current_agg_count > 3.0) {
                             observations.push_back(new_feature);
                             current_agg_count = 1.0;
                         } else {
@@ -325,14 +325,10 @@ fn output_remapped_midi_notes(
                     continue;
                 }
                 let mapped_note = match solo_mode {
-                    SoloMode::Chord => (note - 3..=note)
-                        .rev()
+                    SoloMode::Chord => [note, note - 1, note + 1, note - 2, note + 2]
+                        .into_iter()
                         .find(|note| {
-                            active_chord
-                                .notes()
-                                .iter()
-                                .map(|x| x.to_u8().unwrap().rem_euclid(Note::COUNT as u8))
-                                .contains(&note.rem_euclid(Note::COUNT as u8))
+                            (active_chord.notes()).contains(&(Note::from_u8(*note).unwrap()))
                         })
                         .unwrap_or(note),
                     _ => {
