@@ -10,7 +10,7 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{default_host, StreamConfig, SupportedBufferSize};
 use model::{Model, Observation};
 use num::ToPrimitive;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use strum::EnumCount;
 use websocket::Message;
 
@@ -26,37 +26,39 @@ use itertools::Itertools;
 
 use crate::model::NUM_CHORDS;
 
-#[derive(Debug, PartialEq, Eq, Clone, Copy)]
-enum NoteMode {
-    Chord,
-    Continuous,
-    Chromatic,
-}
-
-#[derive(Serialize)]
-struct FullQ {
-    x: Vec<Note>,
-    y: Vec<Vec<f32>>,
-}
-#[derive(Serialize)]
-struct BucketedQ {
-    x: Vec<Note>,
-    y: Vec<f32>,
-}
-#[derive(Serialize)]
-struct WebPayload {
-    full_q: FullQ,
-    bucketed_q: BucketedQ,
+#[derive(Serialize, Debug)]
+struct InferenceEvent {
     chord: Chord,
-    fft: Vec<f32>,
-    beat: bool,
-    observations: Observations,
+    chord_inferences: Vec<ChordInference>,
+    scale: Scale,
 }
-#[derive(Serialize)]
-struct Observations {
-    x: Vec<Note>,
-    y: Vec<Vec<f32>>,
-    chords: Vec<Chord>,
+#[derive(Deserialize)]
+enum WebInEvent {
+    SoloMode(SoloMode),
+}
+#[derive(Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+enum SoloMode {
+    Chord,
+    Nearest,
+    Transpose,
+}
+#[derive(Serialize, Debug)]
+#[serde(tag = "type")]
+enum WebOutEvent {
+    InferenceEvent(InferenceEvent),
+    MidiEvent(MidiEvent),
+    Beat,
+}
+#[derive(Serialize, Debug)]
+struct MidiEvent {
+    note: u8,
+    mapped_note: u8,
+    on: bool,
+}
+#[derive(Serialize, Debug)]
+struct ChordInference {
+    y: Vec<f32>,
+    chord: Chord,
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -88,7 +90,8 @@ struct Args {
 enum Event {
     Note(bool, u8),
     Chords(Chords),
-    NoteMode(NoteMode),
+    Scale(Scale),
+    SoloMode(SoloMode),
 }
 type Chords = Vec<Chord>;
 
@@ -104,28 +107,19 @@ fn main() {
     } = args.clone();
     let (tx, rx) = mpsc::channel();
     let tx2 = tx.clone();
-    let (t_chords, r_chords) = mpsc::channel::<WebPayload>();
+    let (t_web, r_web) = mpsc::channel::<WebOutEvent>();
     let (t_audio, r_audio) = mpsc::channel::<Vec<f32>>();
     let beat_mutex = Arc::new(Mutex::new(false));
     let beat_mutex_beat = beat_mutex.clone();
+    let t_web_beat = t_web.clone();
     thread::spawn(move || {
         let mut beat = Onset::new(aubio::OnsetMode::SpecFlux, 1024, 512, 44100).unwrap();
         for data in r_audio {
             if beat.do_result(&data).unwrap() > 0.0 {
                 *beat_mutex_beat.lock().unwrap() = true;
+                t_web_beat.send(WebOutEvent::Beat).unwrap();
             }
         }
-    });
-    let tx_input = tx.clone();
-    thread::spawn(move || loop {
-        match stdin().lock().lines().next().unwrap().unwrap().as_str() {
-            "c" => tx_input.send(Event::NoteMode(NoteMode::Chord)).unwrap(),
-            "a" => tx_input.send(Event::NoteMode(NoteMode::Chromatic)).unwrap(),
-            "n" => tx_input
-                .send(Event::NoteMode(NoteMode::Continuous))
-                .unwrap(),
-            _ => {}
-        };
     });
     thread::spawn(move || {
         if chrome {
@@ -140,14 +134,26 @@ fn main() {
             .status()
             .unwrap();
     });
+    let tx_web = tx.clone();
     thread::spawn(move || {
         use websocket::sync::Server;
         let server = Server::bind("127.0.0.1:1234").unwrap();
         for client in server.filter_map(Result::ok) {
-            let mut client = client.accept().unwrap();
-            loop {
-                let chord = r_chords.recv().unwrap();
-                if client
+            let (mut receiver, mut sender) = client.accept().unwrap().split().unwrap();
+            let tx_web = tx_web.clone();
+            thread::spawn(move || {
+                for event in receiver.incoming_messages().flatten() {
+                    if let websocket::OwnedMessage::Text(t) = event {
+                        match serde_json::from_str(&t).expect("Failed to parse websocket message") {
+                            WebInEvent::SoloMode(solo_mode) => {
+                                tx_web.send(Event::SoloMode(solo_mode)).unwrap();
+                            }
+                        }
+                    }
+                }
+            });
+            for chord in r_web.iter() {
+                if sender
                     .send_message(&Message::text(&serde_json::to_string(&chord).unwrap()))
                     .is_err()
                 {
@@ -156,6 +162,7 @@ fn main() {
             }
         }
     });
+    let t_web_audio = t_web.clone();
     thread::spawn(move || {
         {
             let audio = audio.unwrap_or_else(|| "Black".into());
@@ -245,36 +252,22 @@ fn main() {
                         }
                         let chords = model.infer_viterbi(observations.make_contiguous());
                         let chord = &chords[chords.len() - 1];
-
                         tx.send(Event::Chords(chords.clone())).unwrap();
-                        t_chords
-                            .send(WebPayload {
-                                full_q: FullQ {
-                                    x: Note::vec(),
-                                    y: default(),
-                                },
-                                bucketed_q: BucketedQ {
-                                    y: observations
-                                        .iter()
-                                        .last()
-                                        .unwrap()
-                                        .into_iter()
-                                        .copied()
-                                        .collect_vec(),
-                                    x: Note::vec(),
-                                },
+                        let scale = scale_from_chords(&chords);
+                        tx.send(Event::Scale(scale)).unwrap();
+                        t_web_audio
+                            .send(WebOutEvent::InferenceEvent(InferenceEvent {
+                                scale,
                                 chord: chord.clone(),
-                                fft: default(),
-                                beat,
-                                observations: Observations {
-                                    x: Note::vec(),
-                                    y: observations
-                                        .iter()
-                                        .map(|x| x.iter().copied().collect())
-                                        .collect(),
-                                    chords,
-                                },
-                            })
+                                chord_inferences: observations
+                                    .iter()
+                                    .enumerate()
+                                    .map(|(i, x)| ChordInference {
+                                        chord: chords[i].clone(),
+                                        y: x.iter().copied().collect(),
+                                    })
+                                    .collect(),
+                            }))
                             .unwrap();
                     },
                     |err| eprintln!("an error occurred on the output audio stream: {err}"),
@@ -290,13 +283,14 @@ fn main() {
         let _hack = publish_midi_in_events(source.unwrap_or_else(|| "OP-1".into()), tx2);
         block();
     });
-    output_remapped_midi_notes(destination, rx, args.disable_output);
+    output_remapped_midi_notes(destination, rx, args.disable_output, t_web);
 }
 
 fn output_remapped_midi_notes(
     destination: Option<String>,
     rx: mpsc::Receiver<Event>,
     disable_output: bool,
+    t_web: mpsc::Sender<WebOutEvent>,
 ) {
     let player = Player::new(
         &destination.unwrap_or_else(|| "Garage".into()),
@@ -305,23 +299,33 @@ fn output_remapped_midi_notes(
     let mut active_chord = "C".parse().unwrap();
     let mut scale: Scale = "C".parse().unwrap();
     let mut midi_note_remapping_history = vec![0; 256];
-    let mut note_mode = NoteMode::Chord;
+    let mut solo_mode = SoloMode::Chord;
     for event in rx {
         match event {
-            Event::NoteMode(mode) => {
-                note_mode = mode;
+            Event::SoloMode(mode) => {
+                solo_mode = mode;
             }
             Event::Chords(chords) => {
                 active_chord = chords[chords.len() - 1].clone();
-                scale = scale_from_chords(chords);
+            }
+            Event::Scale(new_scale) => {
+                scale = new_scale;
             }
             Event::Note(on, note) => {
                 if !on {
-                    player.play_off(midi_note_remapping_history[note as usize]);
+                    let mapped_note = midi_note_remapping_history[note as usize];
+                    player.play_off(mapped_note);
+                    t_web
+                        .send(WebOutEvent::MidiEvent(MidiEvent {
+                            note,
+                            mapped_note,
+                            on: false,
+                        }))
+                        .unwrap();
                     continue;
                 }
-                let new_note = match note_mode {
-                    NoteMode::Chord => (note - 3..=note)
+                let mapped_note = match solo_mode {
+                    SoloMode::Chord => (note - 3..=note)
                         .rev()
                         .find(|note| {
                             active_chord
@@ -332,8 +336,8 @@ fn output_remapped_midi_notes(
                         })
                         .unwrap_or(note),
                     _ => {
-                        let octave = (note / 12) * 12;
-                        let index = if note_mode == NoteMode::Chromatic {
+                        let octave = (note / Note::COUNT as u8) * Note::COUNT as u8;
+                        let index = if solo_mode == SoloMode::Transpose {
                             note % 12
                         } else {
                             [0, 2, 2, 4, 4, 5, 7, 7, 9, 9, 11, 11][(note % 12) as usize]
@@ -342,9 +346,15 @@ fn output_remapped_midi_notes(
                         octave + index + scale_offset
                     }
                 };
-                midi_note_remapping_history[note as usize] = new_note;
-                player.play_on(new_note);
-                dbg!(note, new_note, &active_chord, scale, note_mode);
+                midi_note_remapping_history[note as usize] = mapped_note;
+                player.play_on(mapped_note);
+                t_web
+                    .send(WebOutEvent::MidiEvent(MidiEvent {
+                        note,
+                        mapped_note,
+                        on: true,
+                    }))
+                    .unwrap();
             }
         }
     }
@@ -464,13 +474,13 @@ impl Player {
 type Features = Observation;
 type F = f32;
 
-fn scale_from_chords(chords: Chords) -> Scale {
+fn scale_from_chords(chords: &Chords) -> Scale {
     let mut candidates = Note::vec()
         .into_iter()
         .flat_map(|root| ScaleBuilder::default().root(root).build())
         .collect_vec();
     let mut all_notes = HashSet::<Note>::new();
-    for chord in chords.into_iter().rev() {
+    for chord in chords.iter().rev() {
         all_notes.extend(chord.notes());
         let remaining_candidates = candidates
             .iter()
