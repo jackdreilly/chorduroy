@@ -141,6 +141,7 @@ fn main() {
         for client in server.filter_map(Result::ok) {
             let (mut receiver, mut sender) = client.accept().unwrap().split().unwrap();
             let tx_web = tx_web.clone();
+            tx_web.send(Event::SoloMode(SoloMode::Chord)).unwrap();
             thread::spawn(move || {
                 for event in receiver.incoming_messages().flatten() {
                     if let websocket::OwnedMessage::Text(t) = event {

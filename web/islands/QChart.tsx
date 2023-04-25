@@ -1,3 +1,4 @@
+import { asset } from "$fresh/runtime.ts";
 import {
   StandardWebSocketClient,
   WebSocketClient,
@@ -130,13 +131,19 @@ export default function QChart() {
     setTimeline((t) => [...t, { chord, time: Date.now() }]);
   }, [timeline, chord]);
   const sliced = chord_inferences.slice(
-    Math.max(0, chord_inferences.length - 10),
+    Math.max(0, chord_inferences.length - 16),
   );
   sliced.reverse();
   return (
     <div>
       <div class="flex items-center">
-        <div class="w-4 m-2">
+        <img
+          src={asset("/logo.webp")}
+          class="w-8 h-8 m-2"
+          alt="the fresh logo: a sliced lemon dripping with juice"
+        />
+        <h1 class="font-bold">Chorduroy</h1>
+        <div class="w-4 m-2 p-2">
           {beat && <span class="flex w-3 h-3 bg-red-500 rounded-full"></span>}
         </div>
         <div class="flex flex-col items-center rounded shadow m-2 p-2">
@@ -145,38 +152,40 @@ export default function QChart() {
             {noteToString(scale.root)}
           </div>
         </div>
+        <div class="flex flex-col items-center rounded shadow m-2 p-2">
+          <div class="text-xs">Chord</div>
+          <div class="font-bold">
+            {chordString(chord)}
+          </div>
+        </div>
+        <ul class="mx-2 items-center text-sm font-medium text-gray-900 bg-white border border-gray-200 rounded-lg sm:flex dark:bg-gray-700 dark:border-gray-600 dark:text-white">
+          {(["Chord", "Nearest", "Transpose"] as SoloMode[]).map((thisMode) => (
+            <li class="px-2 border-b border-gray-200 sm:border-b-0 sm:border-r dark:border-gray-600">
+              <div class="flex items-center pl-3">
+                <input
+                  id="horizontal-list-radio-license"
+                  type="radio"
+                  checked={mode === thisMode}
+                  onChange={() => {
+                    ws?.send(
+                      JSON.stringify({ SoloMode: thisMode }),
+                    );
+                    return setMode(thisMode);
+                  }}
+                  name="list-radio"
+                  class="w-4 h-4 text-blue-600 bg-gray-100 border-gray-300 focus:ring-blue-500 dark:focus:ring-blue-600 dark:ring-offset-gray-700 dark:focus:ring-offset-gray-700 focus:ring-2 dark:bg-gray-600 dark:border-gray-500"
+                />
+                <label
+                  for="horizontal-list-radio-license"
+                  class="w-full py-3 ml-2 text-sm font-medium text-gray-900 dark:text-gray-300"
+                >
+                  {thisMode}
+                </label>
+              </div>
+            </li>
+          ))}
+        </ul>
       </div>
-
-      <h3 class="mb-4 font-semibold text-gray-900 dark:text-white">
-        Solo Mode
-      </h3>
-      <ul class="items-center w-full text-sm font-medium text-gray-900 bg-white border border-gray-200 rounded-lg sm:flex dark:bg-gray-700 dark:border-gray-600 dark:text-white">
-        {(["Chord", "Nearest", "Transpose"] as SoloMode[]).map((thisMode) => (
-          <li class="w-full border-b border-gray-200 sm:border-b-0 sm:border-r dark:border-gray-600">
-            <div class="flex items-center pl-3">
-              <input
-                id="horizontal-list-radio-license"
-                type="radio"
-                checked={mode === thisMode}
-                onChange={() => {
-                  ws?.send(
-                    JSON.stringify({ SoloMode: thisMode }),
-                  );
-                  return setMode(thisMode);
-                }}
-                name="list-radio"
-                class="w-4 h-4 text-blue-600 bg-gray-100 border-gray-300 focus:ring-blue-500 dark:focus:ring-blue-600 dark:ring-offset-gray-700 dark:focus:ring-offset-gray-700 focus:ring-2 dark:bg-gray-600 dark:border-gray-500"
-              />
-              <label
-                for="horizontal-list-radio-license"
-                class="w-full py-3 ml-2 text-sm font-medium text-gray-900 dark:text-gray-300"
-              >
-                {thisMode}
-              </label>
-            </div>
-          </li>
-        ))}
-      </ul>
 
       <TimelineComponent timeline={timeline} />
       <div>
@@ -256,7 +265,7 @@ function chordString(
   }`;
 }
 
-const octaves = 5;
+const octaves = 7;
 
 function Keyboard({ notes }: { notes: number[] }) {
   return (
@@ -268,7 +277,7 @@ function Keyboard({ notes }: { notes: number[] }) {
             style={{
               flex: i % 5 < 2 ? 3 / 7 / 2 : 4 / 7 / 3,
               backgroundColor: notes.includes(
-                  12 * (3 + Math.floor(i / 5)) + [1, 3, 6, 8, 10][i % 5],
+                  12 * (2 + Math.floor(i / 5)) + [1, 3, 6, 8, 10][i % 5],
                 )
                 ? "gray"
                 : "white",
@@ -283,7 +292,7 @@ function Keyboard({ notes }: { notes: number[] }) {
             class="flex-1 border border-black bottom-0 relative"
             style={{
               backgroundColor: notes.includes(
-                  12 * (3 + Math.floor(i / 7)) + [0, 2, 4, 5, 7, 9, 11][i % 7],
+                  12 * (2 + Math.floor(i / 7)) + [0, 2, 4, 5, 7, 9, 11][i % 7],
                 )
                 ? "gray"
                 : "white",
