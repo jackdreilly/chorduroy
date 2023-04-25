@@ -4,30 +4,45 @@ import {
 } from "https://deno.land/x/websocket@v0.1.4/mod.ts";
 import { useEffect, useState } from "preact/hooks";
 const endpoint = "ws://127.0.0.1:1234";
-enum Note {
-  "C",
-  "C#",
-  "D",
-  "D#",
-  "E",
-  "F",
-  "F#",
-  "G",
-  "G#",
-  "A",
-  "A#",
-  "B",
+type Letter =
+  | "C"
+  | "D"
+  | "E"
+  | "F"
+  | "G"
+  | "A"
+  | "B";
+type Accidental =
+  | "Sharp"
+  | "Flat"
+  | "Natural";
+function noteToString({ letter, accidental }: Note): string {
+  function letterToString(letter: Letter): string {
+    return letter;
+  }
+  function accidentalToString(accidental?: Accidental): string {
+    switch (accidental) {
+      case "Flat":
+        return "b";
+      case "Sharp":
+        return "#";
+      default:
+        return "";
+    }
+  }
+  return [letterToString(letter), accidentalToString(accidental)].join("");
 }
-// Create array of notes
-const notes = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
-  .map((n) => Note[n as keyof typeof Note]);
+interface Note {
+  letter: Letter;
+  accidental?: Accidental;
+}
 enum Flavor {
   "Major",
   "Minor",
 }
 interface Chord {
-  flavor: Flavor;
-  note: Note;
+  chord_type: Flavor;
+  root: Note;
 }
 type Observations = {
   x: Note[];
@@ -50,16 +65,15 @@ interface Payload {
   observations: Observations;
 }
 export default function QChart() {
-  const [zoomRaw, setZoom] = useState(1);
   const [timeline, setTimeline] = useState<Timeline>([]);
-  const [{ chord, bucketed_q, full_q, fft, beat, observations }, setState] =
+  const [{ chord, bucketed_q, full_q, beat, observations }, setState] =
     useState<
       Payload
     >({
       full_q: { x: [], y: [] },
       bucketed_q: { x: [], y: [] },
       fft: [],
-      chord: { flavor: Flavor.Major, note: Note.C },
+      chord: { chord_type: Flavor.Major, root: { letter: "C" } },
       beat: false,
       observations: { x: [], y: [], chords: [] },
     });
@@ -79,7 +93,6 @@ export default function QChart() {
     }
     setTimeline((t) => [...t, { chord, time: Date.now() }]);
   }, [timeline, chord]);
-  const zoom = Math.min(zoomRaw, 10000 / fft.length);
   const boost = 2;
   return (
     <>
@@ -97,7 +110,7 @@ export default function QChart() {
                     }%, ${100 - 50 * value}%)`,
                   }}
                 >
-                  {full_q.x[i]}
+                  {noteToString(full_q.x[i])}
                 </div>
               );
             })()}
@@ -112,7 +125,7 @@ export default function QChart() {
                   }%, ${100 - 50 * value}%)`,
                 }}
               >
-                {full_q.x[i]}
+                {noteToString(full_q.x[i])}
               </div>
             ))}
           </div>
@@ -134,7 +147,7 @@ export default function QChart() {
                   }%, ${100 - 50 * value}%)`,
                 }}
               >
-                {observations.x[j]}
+                {noteToString(observations.x[j])}
               </div>
             ))}
             <div class="text-center font-bold flex-1 border-1 border-black h-[10em] rounded text-black">
@@ -144,41 +157,6 @@ export default function QChart() {
         ))}
       </div>
       <TimelineComponent timeline={timeline} />
-      <div class="flex">
-        <div class="m-4">{Math.max(...fft)}</div>
-        <div class="m-4">{fft.length}</div>
-      </div>
-      <div>
-        <input
-          class="m-10"
-          type="range"
-          min={0}
-          step={0.01}
-          max={1}
-          value={zoomRaw}
-          onInput={({ target: { valueAsNumber } }) => {
-            setZoom((_) => valueAsNumber);
-          }}
-        />
-        <label>Zoom</label>
-      </div>
-      <div>
-        <svg
-          class="w-full h-[10em]"
-          viewBox={`0 0 200 50`}
-        >
-          <polyline
-            transform={`scale(1,-1) translate(0,-50)`}
-            points={fft.slice(0, Math.round(fft.length * zoom)).map((v, i) =>
-              `${
-                i / fft.slice(0, Math.round(fft.length * zoom)).length * 200
-              } ${v / Math.max(...fft) * 50}`
-            ).join(" ")}
-            fill="none"
-            stroke="black"
-          />
-        </svg>
-      </div>
     </>
   );
 }
@@ -208,5 +186,7 @@ function TimelineComponent({ timeline }: { timeline: Timeline }) {
 function chordString(
   chord: Chord,
 ): import("https://esm.sh/v113/preact@10.11.0/src/index").ComponentChildren {
-  return `${chord.note}${chord.flavor.toString() === "Major" ? "" : "m"}`;
+  return `${noteToString(chord.root)}${
+    chord.chord_type.toString() === "Major" ? "" : "m"
+  }`;
 }

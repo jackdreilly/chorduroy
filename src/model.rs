@@ -1,77 +1,14 @@
-use std::{
-    fmt::{Debug, Display},
-    ops::Add,
-};
+use std::fmt::{Debug, Display};
 
+use chords::{Chord, ChordBuilder, ChordType};
 use itertools::Itertools;
 use nalgebra::{Const, SMatrix, SVector};
 use nalgebra_mvn::MultivariateNormal;
-use num::Float;
-use num_derive::FromPrimitive;
+use num::{Float, ToPrimitive};
 use ordered_float::OrderedFloat;
-use serde::Serialize;
-use strum::IntoEnumIterator;
-use strum_macros::{EnumIter, FromRepr};
-
-const NUM_NOTES: usize = 12;
+use strum::EnumCount;
+const NUM_NOTES: usize = chords::Note::COUNT;
 pub(crate) const NUM_CHORDS: usize = NUM_NOTES * 2;
-#[derive(Clone, Copy, EnumIter, PartialEq, Eq, Debug, Serialize)]
-#[repr(u8)]
-enum Flavor {
-    Major,
-    Minor,
-}
-
-type Intervals = [u8; 3];
-
-impl From<Flavor> for Intervals {
-    fn from(value: Flavor) -> Self {
-        match value {
-            Flavor::Major => [0, 4, 7],
-            Flavor::Minor => [0, 3, 7],
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
-pub(crate) struct Chord {
-    flavor: Flavor,
-    pub(crate) note: Note,
-}
-impl From<Chord> for usize {
-    fn from(chord: Chord) -> Self {
-        2 * chord.note as usize + chord.flavor as usize
-    }
-}
-
-impl From<Chord> for Intervals {
-    fn from(value: Chord) -> Self {
-        Intervals::from(value.flavor)
-            .into_iter()
-            .map(|f| (f + value.note as u8) % NUM_NOTES as u8)
-            .collect_vec()
-            .try_into()
-            .unwrap()
-    }
-}
-
-#[derive(Clone, Copy, EnumIter, FromPrimitive, Debug, PartialEq, Eq, FromRepr, Serialize, Hash)]
-#[repr(u8)]
-pub(crate) enum Note {
-    A,
-    Bb,
-    B,
-    C,
-    Db,
-    D,
-    Eb,
-    E,
-    F,
-    Gb,
-    G,
-    Ab,
-}
-#[derive(Debug)]
 pub(crate) struct Model {
     gaussians: [MVGaussian; NUM_CHORDS],
     hmm_params: HMMParams,
@@ -121,9 +58,9 @@ impl Model {
             }
         }
         let mut result = Vec::with_capacity(observations.len());
-        result.push(argmax.into());
+        result.push(num_to_chord(argmax));
         for t in (1..observations.len()).rev() {
-            result.push(backpointer[(t, argmax)].into());
+            result.push(num_to_chord(backpointer[(t, argmax)]));
             argmax = backpointer[(t, argmax)];
         }
         result.reverse();
@@ -133,7 +70,7 @@ impl Model {
 impl Default for Model {
     fn default() -> Self {
         Self {
-            gaussians: Chord::vec()
+            gaussians: chords()
                 .into_iter()
                 .map_into()
                 .collect_vec()
@@ -143,42 +80,16 @@ impl Default for Model {
         }
     }
 }
-
-impl Chord {
-    fn vec() -> Vec<Chord> {
-        Note::iter()
-            .flat_map(|note| Flavor::iter().map(move |flavor| Chord { flavor, note }))
-            .collect()
-    }
-
-    fn relative_major(&self) -> Chord {
-        match self.flavor {
-            Flavor::Major => *self,
-            Flavor::Minor => self.relative_flavor(),
-        }
-    }
-
-    fn relative_flavor(&self) -> Chord {
-        match self.flavor {
-            Flavor::Major => Chord {
-                flavor: Flavor::Minor,
-                note: self.note + 9,
-            },
-            Flavor::Minor => Chord {
-                flavor: Flavor::Major,
-                note: self.note + 3,
-            },
-        }
-    }
-
-    pub(crate) fn notes(&self) -> [Note; 3] {
-        Intervals::from(self.flavor)
-            .into_iter()
-            .map(|f| self.note + f)
-            .collect_vec()
-            .try_into()
-            .unwrap()
-    }
+fn chords() -> impl Iterator<Item = Chord> {
+    chords::Note::vec()
+        .into_iter()
+        .cartesian_product([ChordType::Major, ChordType::Minor])
+        .flat_map(|(root, chord_type)| {
+            ChordBuilder::default()
+                .root(root)
+                .chord_type(chord_type)
+                .build()
+        })
 }
 type VNotes = SVector<f32, NUM_NOTES>;
 type MNotes = SMatrix<f32, NUM_NOTES, NUM_NOTES>;
@@ -197,28 +108,17 @@ impl MVGaussian {
             .column_mut(0)
             .data
             .into_slice_mut()
-            .rotate_left(self.chord.note as usize);
+            .rotate_left(self.chord.root.to_usize().unwrap());
         self.mvn
             .logpdf(&observation.fixed_resize::<NUM_NOTES, 1>(0.0).transpose())[(0, 0)]
             .clamp(-1e10, 1e10)
     }
 }
 
-impl From<usize> for Chord {
-    fn from(value: usize) -> Self {
-        Chord::vec()[value]
-    }
-}
-impl From<&usize> for Chord {
-    fn from(value: &usize) -> Self {
-        Chord::vec()[*value]
-    }
-}
-
 impl From<Chord> for MVGaussian {
     fn from(chord: Chord) -> Self {
-        match chord.flavor {
-            Flavor::Major => Self {
+        match chord.chord_type {
+            ChordType::Major => Self {
                 mvn: nalgebra_mvn::MultivariateNormal::from_mean_and_covariance(
                     &MAJOR_MEANS,
                     &MAJOR_COV,
@@ -226,7 +126,7 @@ impl From<Chord> for MVGaussian {
                 .unwrap(),
                 chord,
             },
-            Flavor::Minor => Self {
+            ChordType::Minor => Self {
                 mvn: nalgebra_mvn::MultivariateNormal::from_mean_and_covariance(
                     &MINOR_MEANS,
                     &MINOR_COV,
@@ -234,6 +134,7 @@ impl From<Chord> for MVGaussian {
                 .unwrap(),
                 chord,
             },
+            _ => unreachable!("Only major and minor chords are supported"),
         }
     }
 }
@@ -279,41 +180,30 @@ impl Default for HMMParams {
     }
 }
 
-impl Display for Note {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{self:?}")
-    }
-}
-impl Display for Flavor {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let string = format!("{self:?}");
-        let string = &string.to_lowercase()[..3];
-        write!(f, "{string}")
-    }
-}
-impl Display for Chord {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let Self { note, flavor } = self;
-        write!(f, "{note} {flavor}")
-    }
-}
-
-impl Add<u8> for Note {
-    type Output = Self;
-    fn add(self, rhs: u8) -> Self::Output {
-        Note::from_repr((self as u8 + rhs) % NUM_NOTES as u8).unwrap()
-    }
+fn num_to_chord<N: ToPrimitive>(n: N) -> Chord {
+    let n = n.to_u8().unwrap();
+    let root = n / 2;
+    let chord_type = match n % 2 {
+        0 => ChordType::Major,
+        1 => ChordType::Minor,
+        _ => unreachable!(),
+    };
+    ChordBuilder::default()
+        .root(root.into())
+        .chord_type(chord_type)
+        .build()
+        .unwrap()
 }
 
 #[test]
 fn test_mvn() {
-    let chord: Chord = 0.into();
+    let chord: Chord = num_to_chord(0);
     let mut observation = Observation::zeros();
+    for note in chord.notes() {
+        observation[note.to_usize().unwrap()] = 1.0;
+    }
     let mvn: MVGaussian = chord.into();
     let zeros = mvn.log_pdf(&observation);
-    for note in chord.notes() {
-        observation[note as usize] = 1.0;
-    }
     let exact = mvn.log_pdf(&observation);
     assert!(exact > zeros);
 }
